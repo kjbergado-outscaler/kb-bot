@@ -1,20 +1,25 @@
 # app.py
 import os
 import glob
+import numpy as np
 import pandas as pd
 from bs4 import BeautifulSoup
+from flask import Flask, request, jsonify, render_template_string
 from sentence_transformers import SentenceTransformer
-import numpy as np
+from transformers import pipeline
 import faiss
-from flask import Flask, request, jsonify
 
 # -----------------------------
 # CONFIGURATION
 # -----------------------------
-KB_CSV = "KB_Sheet.csv"           # Your CSV in the project folder
-HTML_FOLDER = "kb_html_files"     # Folder containing HTML files
-TOP_K = 3                         # Top 3 recommendations
+KB_CSV = "KB_Sheet.csv"        # Your CSV file
+HTML_FOLDER = "kb_html_files"  # Folder with HTML KB files
+EMBED_FILE = "kb_embeddings.npy"
+SUMM_FILE = "kb_summaries.npy"
+TOP_K = 3
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
+SUMM_MODEL = "sshleifer/distilbart-cnn-12-6"
+QA_MODEL = "google/flan-t5-small"
 
 # -----------------------------
 # LOAD KB DATA
@@ -27,21 +32,19 @@ texts = []
 
 for _, row in kb_sheet.iterrows():
     kb_id = str(row['Export Import Id'])
-    # Look for matching HTML file
     matches = glob.glob(os.path.join(HTML_FOLDER, f"*{kb_id}*.html"))
     if matches:
         with open(matches[0], 'r', encoding='utf-8') as f:
             html = f.read()
         text_content = BeautifulSoup(html, 'html.parser').get_text(separator=" ", strip=True)
-        kb_entry = {
+        kb_data.append({
             "category": row.get('CATEGORY', ''),
             "subcategory": row.get('SUBCATEGORY', ''),
             "title": row.get('Title', ''),
             "content": text_content,
             "kb_link": row.get('KB LINK', ''),
             "last_modified": row.get('Modified On', '')
-        }
-        kb_data.append(kb_entry)
+        })
         texts.append(text_content)
     else:
         print(f"⚠️ No HTML file found for KB ID: {kb_id}")
@@ -54,60 +57,104 @@ print(f"✅ Loaded {len(kb_data)} KB articles.")
 # -----------------------------
 # EMBEDDINGS
 # -----------------------------
-print("🧠 Creating embeddings...")
+print("🧠 Loading embeddings...")
 model = SentenceTransformer(MODEL_NAME)
-embeddings = model.encode(texts, convert_to_numpy=True, show_progress_bar=True)
+if os.path.exists(EMBED_FILE):
+    embeddings = np.load(EMBED_FILE)
+    print("✅ Loaded precomputed embeddings.")
+else:
+    embeddings = model.encode(texts, convert_to_numpy=True, show_progress_bar=True)
+    np.save(EMBED_FILE, embeddings)
+    print("✅ Computed and saved embeddings.")
 
+# FAISS index
 dimension = embeddings.shape[1]
-index = faiss.IndexFlatL2(dimension)
+faiss.normalize_L2(embeddings)
+index = faiss.IndexFlatIP(dimension)
 index.add(embeddings)
+print("✅ FAISS index ready.")
 
-print("✅ Embeddings and FAISS index ready.")
+# -----------------------------
+# SUMMARIES
+# -----------------------------
+print("📝 Loading summaries...")
+summarizer = pipeline("summarization", model=SUMM_MODEL)
+if os.path.exists(SUMM_FILE):
+    short_summaries = np.load(SUMM_FILE, allow_pickle=True)
+    print("✅ Loaded precomputed summaries.")
+else:
+    short_summaries = []
+    for article in kb_data:
+        try:
+            summary = summarizer(article['content'], max_length=50, min_length=25, do_sample=False)[0]['summary_text']
+        except Exception:
+            summary = article['content'][:100]
+        short_summaries.append(summary)
+    np.save(SUMM_FILE, short_summaries)
+    print("✅ Computed short summaries.")
+
+# -----------------------------
+# QA MODEL
+# -----------------------------
+qa_model = pipeline("text2text-generation", model=QA_MODEL)
+
+def answer_question_fast(query, top_k=TOP_K):
+    q_emb = model.encode([query])
+    faiss.normalize_L2(q_emb)
+    D, I = index.search(q_emb, top_k)
+
+    context = " ".join([short_summaries[i] for i in I[0]])
+    answer = qa_model(
+        f"Answer the question based on the context:\nContext: {context}\nQuestion: {query}",
+        max_new_tokens=150
+    )[0]['generated_text']
+
+    recommendations = []
+    for i in I[0]:
+        recommendations.append({
+            "category": kb_data[i]['category'],
+            "subcategory": kb_data[i]['subcategory'],
+            "title": kb_data[i]['title'],
+            "snippet": short_summaries[i],
+            "kb_link": kb_data[i]['kb_link'],
+            "last_modified": kb_data[i]['last_modified']
+        })
+
+    disclaimer = "⚠️ Disclaimer: Always double-check KB for updates."
+    return disclaimer, answer, recommendations
 
 # -----------------------------
 # FLASK APP
 # -----------------------------
 app = Flask(__name__)
 
-def answer_question_fast(query, top_k=TOP_K):
-    query_emb = model.encode([query], convert_to_numpy=True)
-    D, I = index.search(query_emb, top_k)
+# Home route
+@app.route("/", methods=["GET"])
+def home():
+    html = """
+    <h2>📚 KB Bot</h2>
+    <p>Use POST /chat with JSON: {"query":"your question"}</p>
+    """
+    return render_template_string(html)
 
-    recommendations = []
-    for idx in I[0]:
-        kb = kb_data[idx]
-        snippet = kb['content'][:250] + "..." if len(kb['content']) > 250 else kb['content']
-        recommendations.append({
-            "title": kb['title'],
-            "category": kb['category'],
-            "subcategory": kb['subcategory'],
-            "snippet": snippet,
-            "kb_link": kb['kb_link'],
-            "last_modified": kb['last_modified']
-        })
-
-    disclaimer = "⚠️ This answer is AI-assisted. Please verify against the official KB."
-    answer_text = recommendations[0]['snippet'] if recommendations else "No relevant KB found."
-    return disclaimer, answer_text, recommendations
-
-@app.route("/ask", methods=["POST"])
-def ask():
-    data = request.json
-    query = data.get("query", "")
+# Chat route
+@app.route("/chat", methods=["POST"])
+def chat():
+    req = request.get_json()
+    query = req.get("query", "")
     if not query:
         return jsonify({"error": "No query provided."}), 400
 
     disclaimer, answer, recs = answer_question_fast(query)
-    return jsonify({
-        "disclaimer": disclaimer,
-        "answer": answer,
-        "recommendations": recs
-    })
 
-# Root route
-@app.route("/", methods=["GET"])
-def home():
-    return "KB Bot is running. Use POST /ask with {'query':'your question'}"
+    # Format HTML output
+    html_output = f"<p>{disclaimer}</p><h3>💡 Closest Answer:</h3><p>{answer}</p>"
+    html_output += "<h3>📌 Recommended KB Topics:</h3><ul>"
+    for r in recs:
+        html_output += f"<li><strong>{r['title']}</strong> ({r['kb_link']})<br>Category: {r['category']} | Subcategory: {r['subcategory']}<br>Preview: {r['snippet']}<br>Last Modified: {r['last_modified']}</li>"
+    html_output += "</ul>"
+
+    return html_output
 
 # -----------------------------
 # RUN
