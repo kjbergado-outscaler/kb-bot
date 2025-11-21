@@ -12,8 +12,8 @@ import faiss
 # -----------------------------
 # CONFIGURATION
 # -----------------------------
-KB_CSV = "KB_Sheet.csv"        # Your CSV file
-HTML_FOLDER = "kb_html_files"  # Folder with HTML KB files
+KB_CSV = "KB_Sheet.csv"           # Put your CSV here in the project root
+HTML_FOLDER = "kb_html_files"     # Folder with HTML KB files
 EMBED_FILE = "kb_embeddings.npy"
 SUMM_FILE = "kb_summaries.npy"
 TOP_K = 3
@@ -49,8 +49,8 @@ for _, row in kb_sheet.iterrows():
     else:
         print(f"⚠️ No HTML file found for KB ID: {kb_id}")
 
-if len(kb_data) == 0:
-    raise ValueError("⚠️ No KB content loaded. Check your kb_html_files folder.")
+if not kb_data:
+    raise ValueError("⚠️ No KB content loaded. Check your HTML folder.")
 
 print(f"✅ Loaded {len(kb_data)} KB articles.")
 
@@ -67,7 +67,6 @@ else:
     np.save(EMBED_FILE, embeddings)
     print("✅ Computed and saved embeddings.")
 
-# FAISS index
 dimension = embeddings.shape[1]
 faiss.normalize_L2(embeddings)
 index = faiss.IndexFlatIP(dimension)
@@ -128,7 +127,6 @@ def answer_question_fast(query, top_k=TOP_K):
 # -----------------------------
 app = Flask(__name__)
 
-# Home route
 @app.route("/", methods=["GET"])
 def home():
     html = """
@@ -137,7 +135,6 @@ def home():
     """
     return render_template_string(html)
 
-# Chat route
 @app.route("/chat", methods=["POST"])
 def chat():
     req = request.get_json()
@@ -147,7 +144,6 @@ def chat():
 
     disclaimer, answer, recs = answer_question_fast(query)
 
-    # Format HTML output
     html_output = f"<p>{disclaimer}</p><h3>💡 Closest Answer:</h3><p>{answer}</p>"
     html_output += "<h3>📌 Recommended KB Topics:</h3><ul>"
     for r in recs:
@@ -160,5 +156,6 @@ def chat():
 # RUN
 # -----------------------------
 if __name__ == "__main__":
+    # Only for local dev; Render uses gunicorn
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
